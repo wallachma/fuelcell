@@ -1,2 +1,262 @@
 #this is a test file
 #wow matt this is a sick test file
+# Finite-difference 1D steady-state fuel cell MEA model with simplified Butler-Volmer reaction
+# - Solves hydrogen concentration across an anode gas diffusion layer (GDL) + catalyst layer.
+# - Implements Butler-Volmer at the catalyst/membrane interface to compute reaction flux.
+# - Solves steady heat conduction with convective boundary conditions.
+# - Adds a Monte Carlo ensemble by randomizing the exchange-current-density to mimic stochastic reaction events.
+#
+# This is a simple, extendable prototype to demonstrate the methods you described.
+# It uses only numpy and matplotlib so it should run in most environments.
+#
+# Outputs:
+# - Plots of concentration and temperature profiles
+# - Ensemble mean and a few sample Monte Carlo realizations for the reaction flux
+#
+# You can adapt geometry, parameters, and extend to multiple layers (cathode, membrane, oxygen, water) as needed.
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Physical constants
+F = 96485.3329  # C/mol
+R = 8.314462618  # J/mol/K
+T_ref = 353.15  # K (80 C typical fuel cell temp)
+
+# Geometry (one-dimensional thickness in meters)
+L_gdl = 200e-6   # gas diffusion layer thickness (m)
+L_cl = 10e-6     # catalyst layer thickness (m)
+Nx_gdl = 50
+Nx_cl = 20
+
+# Spatial grids (anode side example)
+x_gdl = np.linspace(0, L_gdl, Nx_gdl)
+x_cl  = np.linspace(L_gdl, L_gdl + L_cl, Nx_gdl+Nx_cl)[Nx_gdl:]  # contiguous numbering not required for solver, just for plotting
+x_all = np.concatenate([x_gdl, x_cl])
+
+# Diffusion coefficients (m^2/s) -- typical orders of magnitude
+D_H2_gdl = 1.0e-5
+D_H2_cl  = 5.0e-6
+
+# Thermal properties for heat conduction example
+k_gdl = 1.0  # W/m/K (order-of-magnitude)
+k_cl  = 0.5  # W/m/K
+h_conv_inlet = 10.0  # W/m^2/K (convective heat transfer at inlet)
+h_conv_outlet = 10.0
+
+# Boundary concentrations (mol/m^3) -- approximate: 1 atm H2 partial pressure -> Henry's law would be needed;
+# here we use a proxy number for dissolved/accessible H2 concentration in pores.
+c_H2_inlet = 40.0  # mol/m^3 (tunable)
+c_H2_outlet_guess = 5.0  # not used as BC; we use zero-flux at membrane except reactive flux via BV
+
+# Butler-Volmer parameters (simplified, per area)
+i0_nominal = 100.0  # A/m^2 (exchange current density nominal)
+alpha = 0.5
+n_e = 2  # electrons per H2 -> 2
+eta = 0.05  # V overpotential (assumed uniform for simplicity)
+T = T_ref
+
+# Monte Carlo ensemble settings
+n_ensembles = 40
+rng = np.random.default_rng(12345)
+
+def butler_volmer(i0, alpha, n, eta, T):
+    """Simplified Butler-Volmer producing current density (A/m^2)."""
+    # forward reaction only (hydrogen oxidation); we keep a simple exponential dependence
+    # i = i0 * (exp(alpha*n*F*eta/(R*T)) - exp(-(1-alpha)*n*F*eta/(R*T)))
+    # for small overpotentials the second term is negligible; include both for completeness
+    arg_fwd = alpha * n * F * eta / (R * T)
+    arg_rev = -(1 - alpha) * n * F * eta / (R * T)
+    return i0 * (np.exp(arg_fwd) - np.exp(arg_rev))
+
+def solve_concentration_fd(D_gdl, D_cl, Nx_gdl, Nx_cl, c_inlet, i_reaction_flux):
+    """
+    Solve steady-state 1D diffusion with a reaction flux at the GDL/CL/membrane interface.
+    The PDE in each region is d/dx(D dc/dx) = 0 (no volumetric reaction), so concentration is linear in each subdomain.
+    Reaction is applied as a Neumann BC at x = L_gdl + L_cl (membrane interface) via flux j = -D dc/dx (mol/m2/s).
+    We'll discretize and solve using finite difference for the whole domain with piecewise D.
+    """
+    Nx_total = Nx_gdl + Nx_cl
+    L_total = L_gdl + L_cl
+    dx_gdl = L_gdl / (Nx_gdl - 1)
+    dx_cl = L_cl / (Nx_cl - 1)
+    # build grid and D(x)
+    x = np.zeros(Nx_total)
+    D = np.zeros(Nx_total)
+    for i in range(Nx_total):
+        if i < Nx_gdl:
+            x[i] = i * dx_gdl
+            D[i] = D_gdl
+        else:
+            x[i] = L_gdl + (i - (Nx_gdl - 1)) * dx_cl  # ensure contiguous
+            D[i] = D_cl
+
+    # Build linear system A c = b for steady diffusion
+    A = np.zeros((Nx_total, Nx_total))
+    b = np.zeros(Nx_total)
+
+    for i in range(Nx_total):
+        if i == 0:
+            # Dirichlet at inlet
+            A[i, i] = 1.0
+            b[i] = c_inlet
+        elif i == Nx_total - 1:
+            # Neumann at membrane interface with imposed reaction flux: -D dc/dx = j_reaction_flux (mol/m2/s)
+            # Finite difference: (c_N - c_{N-1})/dx = -j/D_effective  -> relate unknown c_N
+            # We'll approximate using backward difference:
+            dx_local = x[i] - x[i-1]
+            A[i, i] = 1.0 / dx_local
+            A[i, i-1] = -1.0 / dx_local
+            # right-hand side = - j_reaction_flux / D_effective  but we moved D into discretization
+            # To keep units correct, multiply by 1 (we treat flux directly)
+            b[i] = - i_reaction_flux / D[i]
+        else:
+            # interior points: discretize d/dx(D dc/dx) = 0 -> (D_{i+1/2}(c_{i+1}-c_i)/dx_right - D_{i-1/2}(c_i-c_{i-1})/dx_left) / dx_center = 0
+            # We'll use simple central FD with harmonic mean for diffusion at interfaces
+            dx_left = x[i] - x[i-1]
+            dx_right = x[i+1] - x[i]
+            D_left = 2.0 * D[i] * D[i-1] / (D[i] + D[i-1]) if (D[i] + D[i-1]) > 0 else D[i]
+            D_right = 2.0 * D[i] * D[i+1] / (D[i] + D[i+1]) if (D[i] + D[i+1]) > 0 else D[i]
+            A[i, i-1] = - D_left / (dx_left * (dx_left + dx_right))
+            A[i, i]   =   D_left / (dx_left * (dx_left + dx_right)) + D_right / (dx_right * (dx_left + dx_right))
+            A[i, i+1] = - D_right / (dx_right * (dx_left + dx_right))
+
+    # Solve linear system
+    c = np.linalg.solve(A, b)
+    return x, c
+
+def solve_temperature(k_gdl, k_cl, Nx_gdl, Nx_cl, T_inlet, T_env, heat_gen_per_volume=0.0):
+    """
+    Solve steady 1D heat conduction with volumetric heat generation (very small here) and convective BCs at both ends.
+    Equation: -d/dx(k dT/dx) + q_gen = 0
+    BCs: -k dT/dx|0 = h*(T(0)-T_env),  k dT/dx|L = h*(T(L)-T_env)
+    """
+    Nx_total = Nx_gdl + Nx_cl
+    L_total = L_gdl + L_cl
+    dx_gdl = L_gdl / (Nx_gdl - 1)
+    dx_cl = L_cl / (Nx_cl - 1)
+
+    x = np.zeros(Nx_total)
+    k = np.zeros(Nx_total)
+    for i in range(Nx_total):
+        if i < Nx_gdl:
+            x[i] = i * dx_gdl
+            k[i] = k_gdl
+        else:
+            x[i] = L_gdl + (i - (Nx_gdl - 1)) * dx_cl
+            k[i] = k_cl
+
+    A = np.zeros((Nx_total, Nx_total))
+    b = np.zeros(Nx_total)
+
+    for i in range(Nx_total):
+        if i == 0:
+            # convective BC at inlet: -k dT/dx = h*(T(0)-T_env)
+            # approximate with forward difference: -k*(T1 - T0)/dx = h*(T0 - T_env)
+            dx_local = x[1] - x[0]
+            A[i, i] = -k[i] / dx_local - h_conv_inlet
+            A[i, i+1] = k[i] / dx_local
+            b[i] = - h_conv_inlet * T_env
+        elif i == Nx_total - 1:
+            # convective BC at outlet
+            dx_local = x[i] - x[i-1]
+            A[i, i] = -k[i] / dx_local - h_conv_outlet
+            A[i, i-1] = k[i] / dx_local
+            b[i] = - h_conv_outlet * T_env
+        else:
+            dx_left = x[i] - x[i-1]
+            dx_right = x[i+1] - x[i]
+            k_left = 2.0 * k[i] * k[i-1] / (k[i] + k[i-1]) if (k[i] + k[i-1]) > 0 else k[i]
+            k_right = 2.0 * k[i] * k[i+1] / (k[i] + k[i+1]) if (k[i] + k[i+1]) > 0 else k[i]
+            A[i, i-1] = - k_left / (dx_left * (dx_left + dx_right))
+            A[i, i]   =   k_left / (dx_left * (dx_left + dx_right)) + k_right / (dx_right * (dx_left + dx_right))
+            A[i, i+1] = - k_right / (dx_right * (dx_left + dx_right))
+            b[i] = - heat_gen_per_volume  # volumetric heat generation contribution
+
+    T = np.linalg.solve(A, b)
+    return x, T
+
+# Monte Carlo ensemble: randomize i0 (exchange current density) around nominal value to mimic stochastic reaction activity
+i_reaction_flux_ensembles = []
+concentration_ensembles = []
+temperature_ensembles = []
+for k in range(n_ensembles):
+    # Randomize exchange current density with lognormal-ish scatter
+    i0_rand = i0_nominal * (1.0 + 0.4 * (rng.standard_normal() ) )  # normal perturbation +/-40%
+    i0_rand = max(1e-6, i0_rand)  # avoid negative or zero
+
+    # Compute current density via Butler-Volmer (A/m^2)
+    j_reaction = butler_volmer(i0_rand, alpha, n_e, eta, T)  # [A/m^2]
+    # Convert current density to molar flux of H2 (mol/m^2/s): j_mol = j / (n_e * F)
+    j_mol = j_reaction / (n_e * F)
+
+    # Reaction consumes hydrogen: impose this as Neumann BC on concentration solver
+    x, c = solve_concentration_fd(D_H2_gdl, D_H2_cl, Nx_gdl, Nx_cl, c_H2_inlet, j_mol)
+
+    # Temperature solve: assume heat generation proportional to reaction current (ohmic + reaction heat)
+    # Convert current density to volumetric heat generation estimate (W/m^3) spread in catalyst layer
+    heat_gen_total = abs(j_reaction) * 0.2  # W/m^2 -> small multiplier representing overpotential*current (rough)
+    # spread this across CL volume: heat_gen_per_volume = heat_gen_total / (L_cl)
+    heat_gen_vol = heat_gen_total / L_cl
+
+    xT, T_profile = solve_temperature(k_gdl, k_cl, Nx_gdl, Nx_cl, T_inlet=T_ref, T_env=300.0, heat_gen_per_volume=heat_gen_vol)
+
+    i_reaction_flux_ensembles.append(j_mol)
+    concentration_ensembles.append((x, c))
+    temperature_ensembles.append((xT, T_profile))
+
+# Compute ensemble mean profiles (interpolate to a common grid for averaging)
+# Use x_all (constructed earlier) as plotting grid; we'll average concentrations by linear interpolation
+x_plot = x_all
+c_matrix = np.zeros((n_ensembles, len(x_plot)))
+T_matrix = np.zeros((n_ensembles, len(x_plot)))
+
+for k in range(n_ensembles):
+    xk, ck = concentration_ensembles[k]
+    Tk_x, Tk = temperature_ensembles[k]
+    # Interpolate onto x_plot
+    c_matrix[k, :] = np.interp(x_plot, xk, ck)
+    T_matrix[k, :] = np.interp(x_plot, Tk_x, Tk)
+
+c_mean = c_matrix.mean(axis=0)
+T_mean = T_matrix.mean(axis=0)
+
+# Plot concentration profiles: mean + a few sample realizations
+plt.figure(figsize=(8,4))
+plt.plot(x_plot*1e6, c_mean, label='Ensemble mean')
+for k in range(min(6, n_ensembles)):
+    plt.plot(x_plot*1e6, c_matrix[k,:], linestyle='--', alpha=0.7, label=f'realization {k+1}')
+plt.xlabel('Distance from anode inlet (µm)')
+plt.ylabel('H2 concentration (mol/m^3)')
+plt.title('H2 concentration across GDL + CL (anode side)')
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+# Plot temperature profiles: mean + a few samples
+plt.figure(figsize=(8,4))
+plt.plot(x_plot*1e6, T_mean, label='Ensemble mean')
+for k in range(min(6, n_ensembles)):
+    plt.plot(x_plot*1e6, T_matrix[k,:], linestyle='--', alpha=0.7, label=f'realization {k+1}')
+plt.xlabel('Distance from anode inlet (µm)')
+plt.ylabel('Temperature (K)')
+plt.title('Temperature across GDL + CL (steady conduction with convective BCs)')
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+# Show statistics for reaction flux across ensemble
+j_mols = np.array(i_reaction_flux_ensembles)
+print(f"Reaction molar flux across ensemble: mean = {j_mols.mean():.3e} mol/m^2/s, std = {j_mols.std():.3e} mol/m^2/s")
+print("Sample reaction molar fluxes (mol/m^2/s):", j_mols[:8])
+
+# Print example concentrations at membrane interface (last point)
+print("Example H2 concentration at membrane interface (last node) for first 8 realizations:")
+for k in range(min(8, n_ensembles)):
+    xk, ck = concentration_ensembles[k]
+    print(f" realization {k+1}: c_mem = {ck[-1]:.4f} mol/m^3 (j_mol = {i_reaction_flux_ensembles[k]:.3e} mol/m^2/s)")
+
+# End of script.
+print("Model run complete. Adjust parameters, add oxygen side, and extend the solver to include volumetric reactions if desired.")
